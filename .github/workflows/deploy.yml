@@ -1,0 +1,42 @@
+name: Deploy to Dokploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: Production
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Deploy to Dokploy
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DOKPLOY_HOST }}
+          username: root
+          key: ${{ secrets.DOKPLOY_SSH_KEY }}
+          script: |
+            cd /etc/dokploy/compose/prompt-platform/code
+            
+            # Backup current
+            cp server.js server.js.bak 2>/dev/null || true
+            
+            # Pull latest from GitHub
+            if [ -d .git ]; then
+              git pull origin main
+            else
+              # First time setup
+              rm -f Dockerfile package.json server.js README.md .gitignore
+              git clone https://github.com/johnturek/prompt-platform.git .
+            fi
+            
+            # Rebuild and restart container
+            cd /etc/dokploy/compose/prompt-platform
+            docker compose down
+            docker compose up -d --build
+            
+            echo "Deployed successfully!"
