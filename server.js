@@ -232,11 +232,21 @@ app.post('/join', (req, res) => {
     res.redirect('/participate/' + attendee.event_code);
 });
 
+// Personal join shortlink — used by per-attendee QR codes on printed cards
+app.get('/j/:joinCode', (req, res) => {
+    const attendee = db.prepare('SELECT a.*, e.code as event_code, e.name as event_name FROM attendees a JOIN events e ON a.event_id = e.id WHERE a.join_code = ?').get(req.params.joinCode?.toUpperCase());
+    if (!attendee) return res.send(getHomePage('Invalid join link. Please check your card.'));
+    db.prepare('UPDATE attendees SET joined_at = CURRENT_TIMESTAMP WHERE id = ?').run(attendee.id);
+    req.session.attendee = attendee;
+    res.redirect('/participate/' + attendee.event_code);
+});
+
 // Participant experience
 app.get('/participate/:code', requireParticipant, (req, res) => {
     const event = db.prepare('SELECT * FROM events WHERE code = ?').get(req.params.code);
     if (!event) return res.redirect('/');
-    
+    if (event.status === 'closed') return res.send(getEventClosedPage(event));
+
     const attendee = req.session.attendee;
     const org = db.prepare('SELECT * FROM orgs WHERE event_id = ? AND name = ?').get(event.id, attendee.org);
     
@@ -379,7 +389,40 @@ app.post('/admin/events/:code/attendees', requireAdmin, (req, res) => {
     res.redirect('/admin/events/' + req.params.code);
 });
 
-// Research org and generate prompts
+// Toggle event status (draft / active / closed)
+app.post('/admin/events/:code/status', requireAdmin, (req, res) => {
+    const { status } = req.body;
+    if (!['draft', 'active', 'closed'].includes(status)) return res.redirect('/admin/events/' + req.params.code);
+    db.prepare('UPDATE events SET status = ? WHERE code = ?').run(status, req.params.code);
+    logger.info({ msg: 'Event status changed', code: req.params.code, status });
+    res.redirect('/admin/events/' + req.params.code);
+});
+
+// Print attendee cards (one QR-coded card per attendee)
+app.get('/admin/events/:code/print-cards', requireAdmin, async (req, res) => {
+    const event = db.prepare('SELECT * FROM events WHERE code = ?').get(req.params.code);
+    if (!event) return res.redirect('/admin');
+    const attendees = db.prepare('SELECT * FROM attendees WHERE event_id = ? ORDER BY org, name').all(event.id);
+    const cards = await Promise.all(attendees.map(async (a) => {
+        const url = `https://prompt.turek.in/j/${a.join_code}`;
+        const qr = await QRCode.toDataURL(url, { width: 200, margin: 1 });
+        return { ...a, qr };
+    }));
+    res.send(getPrintCardsPage(event, cards));
+});
+
+// Live stats API (used by admin event page to show real-time join counts)
+app.get('/api/events/:code/stats', requireAdmin, (req, res) => {
+    const event = db.prepare('SELECT id FROM events WHERE code = ?').get(req.params.code);
+    if (!event) return res.status(404).json({ error: 'Not found' });
+    const total    = db.prepare('SELECT COUNT(*) as c FROM attendees WHERE event_id = ?').get(event.id).c;
+    const joined   = db.prepare('SELECT COUNT(*) as c FROM attendees WHERE event_id = ? AND joined_at IS NOT NULL').get(event.id).c;
+    const prompts  = db.prepare('SELECT COUNT(*) as c FROM prompts WHERE event_id = ?').get(event.id).c;
+    const votes    = db.prepare('SELECT COALESCE(SUM(votes),0) as c FROM prompts WHERE event_id = ?').get(event.id).c;
+    res.json({ total, joined, prompts, votes });
+});
+
+
 app.post('/admin/events/:code/research/:orgName', requireAdmin, async (req, res) => {
     const event = db.prepare('SELECT id FROM events WHERE code = ?').get(req.params.code);
     const orgName = decodeURIComponent(req.params.orgName);
@@ -494,27 +537,33 @@ Return ONLY a valid JSON array like:
 app.get('/wall/:code', (req, res) => {
     const event = db.prepare('SELECT * FROM events WHERE code = ?').get(req.params.code);
     if (!event) return res.redirect('/');
-    
+
+    const orgFilter = req.query.org ? decodeURIComponent(req.query.org) : null;
+    const mode = req.query.mode === 'leaderboard' ? 'leaderboard' : 'default';
+
+    const orgClause = orgFilter ? 'AND o.name = ?' : '';
+    const orgArgs   = orgFilter ? [event.id, orgFilter] : [event.id];
+
     const prompts = db.prepare(`
         SELECT p.*, o.name as org_name, a.name as submitter_name, a.org as submitter_org
-        FROM prompts p 
-        LEFT JOIN orgs o ON p.org_id = o.id 
+        FROM prompts p
+        LEFT JOIN orgs o ON p.org_id = o.id
         LEFT JOIN attendees a ON p.submitted_by = a.id
-        WHERE p.event_id = ? 
-        ORDER BY p.created_at DESC 
+        WHERE p.event_id = ? ${orgClause}
+        ORDER BY p.created_at DESC
         LIMIT 50
-    `).all(event.id);
-    
+    `).all(...orgArgs);
+
     const topPrompts = db.prepare(`
         SELECT p.*, o.name as org_name
-        FROM prompts p 
-        LEFT JOIN orgs o ON p.org_id = o.id 
-        WHERE p.event_id = ? 
-        ORDER BY p.votes DESC 
+        FROM prompts p
+        LEFT JOIN orgs o ON p.org_id = o.id
+        WHERE p.event_id = ? ${orgClause}
+        ORDER BY p.votes DESC
         LIMIT 10
-    `).all(event.id);
-    
-    res.send(getLiveWallPage(event, prompts, topPrompts));
+    `).all(...orgArgs);
+
+    res.send(getLiveWallPage(event, prompts, topPrompts, { orgFilter, mode }));
 });
 
 // WebSocket handling
@@ -889,6 +938,9 @@ function getEventDetailPage(event, attendees, orgs, prompts, qrDataUrl) {
         `;
     }).join('');
 
+    const statusColors = { draft: '#fef3c7|#92400e', active: '#d1fae5|#065f46', closed: '#fee2e2|#991b1b' };
+    const [statusBg, statusFg] = (statusColors[event.status] || statusColors.draft).split('|');
+
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -910,7 +962,9 @@ function getEventDetailPage(event, attendees, orgs, prompts, qrDataUrl) {
         .qr-section .url { color: #666; font-size: 0.9rem; word-break: break-all; }
         .actions { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 1rem; }
         .actions a, .actions button { padding: 0.5rem 1rem; background: var(--primary); color: white; text-decoration: none; border-radius: 6px; border: none; cursor: pointer; font-size: 0.9rem; }
-        .actions a.secondary { background: #6b7280; }
+        .actions a.secondary, .actions button.secondary { background: #6b7280; }
+        .actions a.purple, .actions button.purple { background: #7c3aed; }
+        .actions a.green, .actions button.green { background: #059669; }
         table { width: 100%; border-collapse: collapse; }
         th, td { padding: 0.5rem; text-align: left; border-bottom: 1px solid #e0e0e0; font-size: 0.9rem; }
         th { font-weight: 600; color: #666; }
@@ -927,6 +981,9 @@ function getEventDetailPage(event, attendees, orgs, prompts, qrDataUrl) {
         .full-width { grid-column: 1 / -1; }
         .del-btn { background: none; border: none; cursor: pointer; font-size: 1rem; opacity: 0.5; }
         .del-btn:hover { opacity: 1; }
+        .status-badge { display: inline-block; padding: 0.3rem 0.8rem; border-radius: 12px; font-size: 0.85rem; font-weight: 700; }
+        .controls-row { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; margin-top: 0.75rem; }
+        .stat-pill { background: #f0f4ff; border-radius: 8px; padding: 0.4rem 0.9rem; font-size: 0.9rem; font-weight: 600; color: #1e40af; }
         @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
     </style>
 </head>
@@ -937,16 +994,43 @@ function getEventDetailPage(event, attendees, orgs, prompts, qrDataUrl) {
     </div>
     <div class="container">
         <div class="grid">
+
+            <!-- Event Controls (full width) -->
+            <div class="card full-width">
+                <h2>⚙️ Event Controls</h2>
+                <div style="display:flex;align-items:center;gap:1rem;flex-wrap:wrap;">
+                    <span class="status-badge" style="background:${statusBg};color:${statusFg}">
+                        ${event.status === 'active' ? '🟢' : event.status === 'closed' ? '🔴' : '🟡'} ${event.status.toUpperCase()}
+                    </span>
+                    <span class="stat-pill" id="statJoined">👥 -- / ${attendees.length} joined</span>
+                    <span class="stat-pill" id="statPrompts">💬 ${prompts.length} prompts</span>
+                    <span class="stat-pill" id="statVotes">❤️ -- votes</span>
+                </div>
+                <div class="controls-row" style="margin-top:1rem">
+                    ${event.status !== 'active'  ? `<form method="POST" action="/admin/events/${event.code}/status" style="display:inline"><input type="hidden" name="status" value="active"><button class="actions green" style="padding:0.5rem 1.25rem;border-radius:6px;font-size:0.9rem;cursor:pointer">🟢 Open Event</button></form>` : ''}
+                    ${event.status !== 'closed'  ? `<form method="POST" action="/admin/events/${event.code}/status" style="display:inline"><input type="hidden" name="status" value="closed"><button class="actions secondary" style="padding:0.5rem 1.25rem;border-radius:6px;font-size:0.9rem;cursor:pointer">🔴 Close Event</button></form>` : ''}
+                    ${event.status !== 'draft'   ? `<form method="POST" action="/admin/events/${event.code}/status" style="display:inline"><input type="hidden" name="status" value="draft"><button class="actions secondary" style="padding:0.5rem 1.25rem;border-radius:6px;font-size:0.9rem;cursor:pointer;background:#d97706">🟡 Back to Draft</button></form>` : ''}
+                </div>
+                <div class="controls-row">
+                    <strong style="font-size:0.85rem;color:#666">🖥️ Project:</strong>
+                    <a href="/wall/${event.code}" target="_blank" class="actions" style="padding:0.4rem 0.9rem;border-radius:6px;font-size:0.85rem;text-decoration:none">📺 Live Wall</a>
+                    <a href="/wall/${event.code}?mode=leaderboard" target="_blank" class="actions purple" style="padding:0.4rem 0.9rem;border-radius:6px;font-size:0.85rem;text-decoration:none">🏆 Leaderboard</a>
+                    ${orgList.map(o => `<a href="/wall/${event.code}?org=${encodeURIComponent(o)}" target="_blank" class="actions secondary" style="padding:0.4rem 0.9rem;border-radius:6px;font-size:0.85rem;text-decoration:none">🏢 ${o}</a>`).join('')}
+                </div>
+                <div class="controls-row">
+                    <strong style="font-size:0.85rem;color:#666">📤 Export:</strong>
+                    <a href="/admin/events/${event.code}/export" class="actions secondary" style="padding:0.4rem 0.9rem;border-radius:6px;font-size:0.85rem;text-decoration:none">📥 JSON</a>
+                    <a href="/admin/events/${event.code}/export?format=csv" class="actions secondary" style="padding:0.4rem 0.9rem;border-radius:6px;font-size:0.85rem;text-decoration:none">📊 CSV</a>
+                    <button onclick="copyTopPrompts()" class="actions secondary" style="padding:0.4rem 0.9rem;border-radius:6px;font-size:0.85rem">📋 Copy Top Prompts</button>
+                    <a href="/admin/events/${event.code}/print-cards" target="_blank" class="actions secondary" style="padding:0.4rem 0.9rem;border-radius:6px;font-size:0.85rem;text-decoration:none">🖨️ Print Cards</a>
+                </div>
+            </div>
+
             <div class="card qr-section">
                 <h2>📱 Join QR Code</h2>
                 <img src="${qrDataUrl}" alt="QR Code">
                 <div class="code">${event.code}</div>
                 <div class="url">prompt.turek.in/join/${event.code}</div>
-                <div class="actions">
-                    <a href="/wall/${event.code}" target="_blank">📺 Live Wall</a>
-                    <a href="/admin/events/${event.code}/export" class="secondary">📥 JSON</a>
-                    <a href="/admin/events/${event.code}/export?format=csv" class="secondary">📊 CSV</a>
-                </div>
             </div>
             
             <div class="card">
@@ -1003,6 +1087,28 @@ function getEventDetailPage(event, attendees, orgs, prompts, qrDataUrl) {
         </div>
     </div>
     <script>
+        // Live stats polling
+        async function refreshStats() {
+            try {
+                const data = await fetch('/api/events/${event.code}/stats').then(r => r.json());
+                document.getElementById('statJoined').textContent = '👥 ' + data.joined + ' / ' + data.total + ' joined';
+                document.getElementById('statPrompts').textContent = '💬 ' + data.prompts + ' prompts';
+                document.getElementById('statVotes').textContent = '❤️ ' + data.votes + ' votes';
+            } catch(e) {}
+        }
+        refreshStats();
+        setInterval(refreshStats, 10000);
+
+        async function copyTopPrompts() {
+            try {
+                const data = await fetch('/admin/events/${event.code}/export').then(r => r.json());
+                const top = data.slice(0, 10);
+                const text = top.map((p, i) => \`\${i+1}. [\${p.app || 'General'}] \${p.text}\`).join('\\n\\n');
+                await navigator.clipboard.writeText(text);
+                alert('Top ' + top.length + ' prompts copied to clipboard!');
+            } catch(e) { alert('Copy failed'); }
+        }
+
         async function researchOrg(orgName) {
             const btn = event.target;
             btn.disabled = true;
@@ -1207,6 +1313,10 @@ function getParticipatePage(event, attendee, orgPrompts, allPrompts, userVotes) 
         .submit-row select { flex: 1; padding: 0.5rem; border: 2px solid #e0e0e0; border-radius: 8px; }
         .submit-row button { padding: 0.5rem 1.5rem; background: var(--primary); color: white; border: none; border-radius: 8px; cursor: pointer; font-weight: 600; }
         .empty { text-align: center; padding: 2rem; color: #666; }
+        .app-filter { display: flex; gap: 0.5rem; flex-wrap: wrap; padding: 0.75rem 0 0.25rem; }
+        .filter-chip { padding: 0.35rem 0.9rem; border: 2px solid #e0e0e0; background: white; border-radius: 20px; cursor: pointer; font-size: 0.8rem; font-weight: 600; transition: all 0.15s; }
+        .filter-chip.active { background: var(--primary); color: white; border-color: var(--primary); }
+        .filter-chip:hover:not(.active) { border-color: var(--primary); color: var(--primary); }
     </style>
 </head>
 <body>
@@ -1219,8 +1329,18 @@ function getParticipatePage(event, attendee, orgPrompts, allPrompts, userVotes) 
         <div class="tab active" onclick="switchTab('org')">⭐ For ${attendee.org}<span class="tab-count">${orgPrompts.length}</span></div>
         <div class="tab" onclick="switchTab('all')">📋 All Prompts<span class="tab-count">${allPrompts.length}</span></div>
     </div>
-    
+
     <div class="container">
+        <!-- App filter chips -->
+        <div class="app-filter">
+            <button class="filter-chip active" onclick="filterApp('all', this)">All</button>
+            <button class="filter-chip" onclick="filterApp('Word', this)">📝 Word</button>
+            <button class="filter-chip" onclick="filterApp('Excel', this)">📊 Excel</button>
+            <button class="filter-chip" onclick="filterApp('PowerPoint', this)">📑 PowerPoint</button>
+            <button class="filter-chip" onclick="filterApp('Outlook', this)">📧 Outlook</button>
+            <button class="filter-chip" onclick="filterApp('Teams', this)">💬 Teams</button>
+            <button class="filter-chip" onclick="filterApp('General', this)">✨ General</button>
+        </div>
         <!-- Submit new prompt -->
         <div class="submit-card">
             <h3>💡 Share Your Prompt</h3>
@@ -1254,6 +1374,15 @@ function getParticipatePage(event, attendee, orgPrompts, allPrompts, userVotes) 
             document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
             document.querySelector(\`.tab[onclick="switchTab('\${tab}')"]\`).classList.add('active');
             document.getElementById('panel-' + tab).classList.add('active');
+        }
+
+        function filterApp(app, chip) {
+            document.querySelectorAll('.filter-chip').forEach(c => c.classList.remove('active'));
+            chip.classList.add('active');
+            document.querySelectorAll('.prompt-card').forEach(card => {
+                const badge = card.querySelector('.app-badge');
+                card.style.display = (app === 'all' || (badge && badge.textContent.trim() === app)) ? '' : 'none';
+            });
         }
         
         async function toggleVote(promptId, btn) {
@@ -1331,7 +1460,73 @@ function getParticipatePage(event, attendee, orgPrompts, allPrompts, userVotes) 
 </html>`;
 }
 
-function getLiveWallPage(event, prompts, topPrompts) {
+function getLiveWallPage(event, prompts, topPrompts, options = {}) {
+    const { orgFilter = null, mode = 'default' } = options;
+    const subtitle = orgFilter ? `🏢 ${orgFilter}` : '';
+    const isLeaderboard = mode === 'leaderboard';
+
+    if (isLeaderboard) {
+        return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🏆 Top Prompts — ${event.name}</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'Segoe UI', sans-serif; background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%); color: white; min-height: 100vh; padding: 2rem; }
+        h1 { text-align: center; font-size: 2.5rem; margin-bottom: 0.5rem; background: linear-gradient(135deg, #fbbf24, #f472b6); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .subtitle { text-align: center; color: rgba(255,255,255,0.6); margin-bottom: 2rem; font-size: 1.1rem; }
+        .leaderboard { max-width: 900px; margin: 0 auto; }
+        .entry { display: flex; gap: 1.25rem; align-items: flex-start; background: rgba(255,255,255,0.07); border-radius: 14px; padding: 1.25rem 1.5rem; margin-bottom: 1rem; backdrop-filter: blur(6px); transition: background 0.3s; }
+        .entry.top1 { background: rgba(251,191,36,0.18); border: 1px solid rgba(251,191,36,0.4); }
+        .entry.top2 { background: rgba(148,163,184,0.15); border: 1px solid rgba(148,163,184,0.3); }
+        .entry.top3 { background: rgba(217,119,6,0.15); border: 1px solid rgba(217,119,6,0.3); }
+        .rank { font-size: 2rem; font-weight: 900; min-width: 2.5rem; text-align: center; }
+        .rank.r1 { color: #fbbf24; }
+        .rank.r2 { color: #94a3b8; }
+        .rank.r3 { color: #d97706; }
+        .body { flex: 1; }
+        .prompt-text { font-size: 1.15rem; line-height: 1.5; margin-bottom: 0.5rem; }
+        .meta { display: flex; gap: 1rem; font-size: 0.85rem; opacity: 0.65; }
+        .votes { font-size: 1.5rem; font-weight: 800; color: #f472b6; min-width: 3rem; text-align: right; align-self: center; }
+        .empty { text-align: center; padding: 4rem; opacity: 0.5; font-size: 1.2rem; }
+    </style>
+</head>
+<body>
+    <h1>🏆 Top Prompts</h1>
+    <div class="subtitle">${event.name}${orgFilter ? ' · ' + orgFilter : ''}</div>
+    <div class="leaderboard" id="board">
+        ${topPrompts.length ? topPrompts.map((p, i) => `
+            <div class="entry ${i===0?'top1':i===1?'top2':i===2?'top3':''}" data-id="${p.id}">
+                <div class="rank ${i===0?'r1':i===1?'r2':i===2?'r3':''}">${i===0?'🥇':i===1?'🥈':i===2?'🥉':'#'+(i+1)}</div>
+                <div class="body">
+                    <div class="prompt-text">${p.text}</div>
+                    <div class="meta">
+                        ${p.org_name ? `<span>🏢 ${p.org_name}</span>` : ''}
+                        ${p.app ? `<span>${p.app}</span>` : ''}
+                    </div>
+                </div>
+                <div class="votes" id="v${p.id}">❤️ ${p.votes||0}</div>
+            </div>
+        `).join('') : '<div class="empty">No prompts yet</div>'}
+    </div>
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        const socket = io();
+        socket.emit('join-event', ${event.id});
+        const voteCounts = {${topPrompts.map(p => `${p.id}:${p.votes||0}`).join(',')}};
+        socket.on('vote-update', ({ promptId, votes }) => {
+            voteCounts[promptId] = votes;
+            const el = document.getElementById('v' + promptId);
+            if (el) el.textContent = '❤️ ' + votes;
+        });
+    </script>
+</body>
+</html>`;
+    }
+
+    // Default wall mode
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1343,10 +1538,12 @@ function getLiveWallPage(event, prompts, topPrompts) {
         body { font-family: 'Segoe UI', sans-serif; background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%); color: white; min-height: 100vh; overflow: hidden; }
         .header { background: rgba(0,0,0,0.3); padding: 1.5rem 2rem; display: flex; justify-content: space-between; align-items: center; }
         .header h1 { font-size: 2rem; background: linear-gradient(135deg, #667eea, #764ba2); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .header-right { display: flex; gap: 2rem; align-items: center; }
         .stats { display: flex; gap: 2rem; }
         .stat { text-align: center; }
         .stat-value { font-size: 2.5rem; font-weight: bold; }
         .stat-label { font-size: 0.9rem; opacity: 0.7; }
+        .filter-tag { background: rgba(124,58,237,0.4); border: 1px solid rgba(124,58,237,0.6); border-radius: 20px; padding: 0.3rem 0.9rem; font-size: 0.85rem; }
         .main { display: grid; grid-template-columns: 2fr 1fr; gap: 2rem; padding: 2rem; height: calc(100vh - 100px); }
         .feed { overflow: hidden; }
         .feed h2 { margin-bottom: 1rem; font-size: 1.25rem; opacity: 0.8; }
@@ -1365,20 +1562,25 @@ function getLiveWallPage(event, prompts, topPrompts) {
         .rank.silver { color: #94a3b8; }
         .rank.bronze { color: #d97706; }
         .top-prompt-text { flex: 1; font-size: 0.95rem; line-height: 1.4; }
-        .top-votes { color: #f472b6; font-weight: bold; }
+        .top-votes { color: #f472b6; font-weight: bold; white-space: nowrap; }
     </style>
 </head>
 <body>
     <div class="header">
-        <h1>🎯 ${event.name}</h1>
-        <div class="stats">
-            <div class="stat">
-                <div class="stat-value" id="promptCount">${prompts.length}</div>
-                <div class="stat-label">Prompts</div>
-            </div>
-            <div class="stat">
-                <div class="stat-value" id="voteCount">${prompts.reduce((sum, p) => sum + (p.votes || 0), 0)}</div>
-                <div class="stat-label">Votes</div>
+        <div>
+            <h1>🎯 ${event.name}</h1>
+            ${subtitle ? `<div class="filter-tag">${subtitle}</div>` : ''}
+        </div>
+        <div class="header-right">
+            <div class="stats">
+                <div class="stat">
+                    <div class="stat-value" id="promptCount">${prompts.length}</div>
+                    <div class="stat-label">Prompts</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value" id="voteCount">${prompts.reduce((s, p) => s + (p.votes || 0), 0)}</div>
+                    <div class="stat-label">Votes</div>
+                </div>
             </div>
         </div>
     </div>
@@ -1402,13 +1604,15 @@ function getLiveWallPage(event, prompts, topPrompts) {
         
         <div class="leaderboard">
             <h2>🏆 Top Prompts</h2>
-            ${topPrompts.map((p, i) => `
-                <div class="top-prompt">
-                    <div class="rank ${i === 0 ? 'gold' : i === 1 ? 'silver' : i === 2 ? 'bronze' : ''}">#${i + 1}</div>
-                    <div class="top-prompt-text">${p.text.substring(0, 80)}${p.text.length > 80 ? '...' : ''}</div>
-                    <div class="top-votes">❤️ ${p.votes || 0}</div>
-                </div>
-            `).join('')}
+            <div id="topList">
+                ${topPrompts.map((p, i) => `
+                    <div class="top-prompt" data-id="${p.id}">
+                        <div class="rank ${i === 0 ? 'gold' : i === 1 ? 'silver' : i === 2 ? 'bronze' : ''}">#${i + 1}</div>
+                        <div class="top-prompt-text">${p.text.substring(0, 80)}${p.text.length > 80 ? '...' : ''}</div>
+                        <div class="top-votes" id="tv${p.id}">❤️ ${p.votes || 0}</div>
+                    </div>
+                `).join('')}
+            </div>
         </div>
     </div>
     
@@ -1416,8 +1620,12 @@ function getLiveWallPage(event, prompts, topPrompts) {
     <script>
         const socket = io();
         socket.emit('join-event', ${event.id});
-        
+
+        // Track per-prompt votes to compute accurate total (fixes counter drift)
+        const promptVotes = {${prompts.map(p => `${p.id}:${p.votes||0}`).join(',')}};
+
         socket.on('new-prompt', (prompt) => {
+            promptVotes[prompt.id] = 0;
             const feed = document.getElementById('feedScroll');
             const item = document.createElement('div');
             item.className = 'prompt-item';
@@ -1426,19 +1634,22 @@ function getLiveWallPage(event, prompts, topPrompts) {
                 <div class="prompt-meta">
                     \${prompt.submitter_name ? \`<span>👤 \${prompt.submitter_name}</span>\` : ''}
                     <span class="prompt-org">🏢 \${prompt.org_name || prompt.submitter_org || 'General'}</span>
-                    <span class="prompt-votes">❤️ \${prompt.vote_count || 0}</span>
+                    <span class="prompt-votes">❤️ 0</span>
                 </div>
             \`;
             feed.insertBefore(item, feed.firstChild);
-            
-            // Update count
-            const countEl = document.getElementById('promptCount');
-            countEl.textContent = parseInt(countEl.textContent) + 1;
+            document.getElementById('promptCount').textContent = parseInt(document.getElementById('promptCount').textContent) + 1;
         });
-        
+
         socket.on('vote-update', ({ promptId, votes }) => {
-            const countEl = document.getElementById('voteCount');
-            countEl.textContent = parseInt(countEl.textContent) + 1;
+            const prev = promptVotes[promptId] || 0;
+            promptVotes[promptId] = votes;
+            const delta = votes - prev;
+            const totalEl = document.getElementById('voteCount');
+            totalEl.textContent = parseInt(totalEl.textContent) + delta;
+            // Update leaderboard entry if visible
+            const tvEl = document.getElementById('tv' + promptId);
+            if (tvEl) tvEl.textContent = '❤️ ' + votes;
         });
     </script>
 </body>
@@ -1446,6 +1657,87 @@ function getLiveWallPage(event, prompts, topPrompts) {
 }
 
 // ============ ERROR HANDLER ============
+
+function getEventClosedPage(event) {
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Workshop Ended - ${event.name}</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'Segoe UI', sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+        .card { background: white; border-radius: 20px; padding: 3rem; max-width: 480px; width: 90%; text-align: center; box-shadow: 0 30px 60px rgba(0,0,0,0.25); }
+        .icon { font-size: 4rem; margin-bottom: 1rem; }
+        h1 { font-size: 1.75rem; margin-bottom: 0.75rem; color: #1e293b; }
+        p { color: #64748b; line-height: 1.6; margin-bottom: 1.5rem; }
+        .event-name { font-weight: 700; color: #7c3aed; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="icon">🎉</div>
+        <h1>Thanks for participating!</h1>
+        <p>The <span class="event-name">${event.name}</span> workshop has ended. Your prompts and votes have been recorded.</p>
+        <p style="font-size:0.9rem;color:#94a3b8">Ask your facilitator to share the results!</p>
+    </div>
+</body>
+</html>`;
+}
+
+function getPrintCardsPage(event, cards) {
+    const cardHtml = cards.map(a => `
+        <div class="card">
+            <div class="event-name">${event.name}</div>
+            <div class="attendee-name">${a.name}</div>
+            <div class="attendee-org">${a.org}${a.role ? ' · ' + a.role : ''}</div>
+            <img src="${a.qr}" alt="QR code" class="qr">
+            <div class="join-code">${a.join_code}</div>
+            <div class="instructions">Scan QR or go to prompt.turek.in and enter your code</div>
+        </div>
+    `).join('');
+
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Attendee Cards — ${event.name}</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'Segoe UI', sans-serif; background: #f5f5f5; padding: 1rem; }
+        .controls { text-align: center; padding: 1rem; margin-bottom: 1rem; }
+        .controls button { padding: 0.75rem 2rem; background: #0078d4; color: white; border: none; border-radius: 8px; font-size: 1rem; cursor: pointer; margin-right: 0.5rem; }
+        .controls button.secondary { background: #6b7280; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 1rem; max-width: 1100px; margin: 0 auto; }
+        .card { background: white; border-radius: 12px; padding: 1.25rem; text-align: center; box-shadow: 0 2px 8px rgba(0,0,0,0.1); border: 2px solid #e0e0e0; page-break-inside: avoid; }
+        .event-name { font-size: 0.7rem; color: #888; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 0.5rem; }
+        .attendee-name { font-size: 1.2rem; font-weight: 700; color: #1e293b; margin-bottom: 0.25rem; }
+        .attendee-org { font-size: 0.85rem; color: #7c3aed; font-weight: 600; margin-bottom: 0.75rem; }
+        .qr { width: 150px; height: 150px; border-radius: 8px; margin-bottom: 0.75rem; }
+        .join-code { font-size: 1.5rem; font-weight: 900; letter-spacing: 0.2em; color: #0078d4; margin-bottom: 0.4rem; font-family: monospace; }
+        .instructions { font-size: 0.7rem; color: #94a3b8; line-height: 1.4; }
+        @media print {
+            body { background: white; padding: 0; }
+            .controls { display: none; }
+            .grid { gap: 0.5rem; }
+            .card { box-shadow: none; border: 1px solid #ccc; }
+        }
+    </style>
+</head>
+<body>
+    <div class="controls">
+        <button onclick="window.print()">🖨️ Print Cards</button>
+        <button class="secondary" onclick="window.close()">✕ Close</button>
+        <span style="margin-left:1rem;color:#666;font-size:0.9rem">${cards.length} cards · ${event.name}</span>
+    </div>
+    <div class="grid">
+        ${cardHtml || '<p style="text-align:center;color:#666;padding:3rem">No attendees added yet.</p>'}
+    </div>
+</body>
+</html>`;
+}
+
 app.use((err, req, res, next) => {
     logger.error({ msg: 'Unhandled error', err: err.message, stack: err.stack, url: req.url });
     res.status(500).json({ error: 'Internal server error' });
