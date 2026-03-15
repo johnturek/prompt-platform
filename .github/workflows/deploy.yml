@@ -12,30 +12,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Deploy to Dokploy
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.DOKPLOY_HOST }}
-          username: root
-          key: ${{ secrets.DOKPLOY_SSH_KEY }}
-          script: |
-            cd /etc/dokploy/compose/prompt-platform/code
-            
-            # Backup current
-            cp server.js server.js.bak 2>/dev/null || true
-            
-            # Pull latest from GitHub
-            if [ -d .git ]; then
-              git pull origin main
-            else
-              # First time setup
-              rm -f Dockerfile package.json server.js README.md .gitignore
-              git clone https://github.com/johnturek/prompt-platform.git .
-            fi
-            
-            # Rebuild and restart container
-            cd /etc/dokploy/compose/prompt-platform
-            docker compose down
-            docker compose up -d --build
-            
-            echo "Deployed successfully!"
+      - name: Trigger deploy webhook
+        run: |
+          PAYLOAD='{"ref":"${{ github.ref }}","sha":"${{ github.sha }}"}'
+          SIGNATURE="sha256=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "${{ secrets.WEBHOOK_SECRET }}" | cut -d' ' -f2)"
+          
+          curl -X POST "https://deploy.turek.in/deploy/prompt-platform" \
+            -H "Content-Type: application/json" \
+            -H "X-Hub-Signature-256: $SIGNATURE" \
+            -d "$PAYLOAD" \
+            --fail --show-error
