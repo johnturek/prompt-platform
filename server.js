@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const session = require('express-session');
 const { Server } = require('socket.io');
@@ -6,13 +7,40 @@ const Database = require('better-sqlite3');
 const bcrypt = require('bcryptjs');
 const QRCode = require('qrcode');
 const path = require('path');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const winston = require('winston');
+const multer = require('multer');
+const { stringify } = require('csv-stringify/sync');
+
+// ============ LOGGER ============
+const logger = winston.createLogger({
+    level: process.env.LOG_LEVEL || 'info',
+    format: winston.format.combine(
+        winston.format.timestamp(),
+        winston.format.errors({ stack: true }),
+        process.env.NODE_ENV === 'production'
+            ? winston.format.json()
+            : winston.format.combine(winston.format.colorize(), winston.format.simple())
+    ),
+    transports: [new winston.transports.Console()]
+});
+
+// ============ RATE LIMITERS ============
+const globalLimiter = rateLimit({ windowMs: 60_000, max: 200, standardHeaders: true, legacyHeaders: false });
+const loginLimiter = rateLimit({ windowMs: 15 * 60_000, max: 20, message: { error: 'Too many login attempts, try again later' } });
+const apiLimiter  = rateLimit({ windowMs: 60_000, max: 60, message: { error: 'Rate limit exceeded' } });
+
+// multer (in-memory, CSV import only)
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 1_000_000 } });
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 
 // Database setup
-const db = new Database('/data/prompt.db');
+const DB_PATH = process.env.DB_PATH || '/data/prompt.db';
+const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 
 // Initialize tables
@@ -81,6 +109,14 @@ db.exec(`
         FOREIGN KEY (attendee_id) REFERENCES attendees(id),
         UNIQUE(prompt_id, attendee_id)
     );
+
+    CREATE TABLE IF NOT EXISTS prompt_flags (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        prompt_id INTEGER NOT NULL UNIQUE,
+        reason TEXT,
+        flagged_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (prompt_id) REFERENCES prompts(id)
+    );
 `);
 
 // Create default admin user
@@ -89,15 +125,33 @@ try {
     db.prepare('INSERT OR IGNORE INTO users (username, password_hash, role) VALUES (?, ?, ?)').run('admin', adminHash, 'admin');
 } catch (e) {}
 
-// Middleware
+// ============ MIDDLEWARE ============
+app.set('trust proxy', 1);
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(globalLimiter);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(session({
-    secret: process.env.SESSION_SECRET || 'dev-secret',
+    secret: process.env.SESSION_SECRET || 'dev-secret-change-me',
     resave: false,
     saveUninitialized: false,
-    cookie: { secure: false, maxAge: 24 * 60 * 60 * 1000 }
+    cookie: {
+        secure: process.env.NODE_ENV === 'production' && process.env.HTTPS === 'true',
+        httpOnly: true,
+        sameSite: 'lax',
+        maxAge: 24 * 60 * 60 * 1000
+    }
 }));
+
+// Health endpoint (before auth middleware)
+app.get('/health', (req, res) => {
+    try {
+        db.prepare('SELECT 1').get();
+        res.json({ status: 'ok', uptime: process.uptime(), ts: new Date().toISOString() });
+    } catch (e) {
+        res.status(503).json({ status: 'error', message: e.message });
+    }
+});
 
 // Auth middleware
 function requireAdmin(req, res, next) {
@@ -199,7 +253,7 @@ app.get('/participate/:code', requireParticipant, (req, res) => {
 });
 
 // Submit prompt
-app.post('/api/prompts', requireParticipant, (req, res) => {
+app.post('/api/prompts', apiLimiter, requireParticipant, (req, res) => {
     const { text, app: appType, eventId } = req.body;
     const attendee = req.session.attendee;
     
@@ -220,7 +274,7 @@ app.post('/api/prompts', requireParticipant, (req, res) => {
 });
 
 // Vote
-app.post('/api/vote/:promptId', requireParticipant, (req, res) => {
+app.post('/api/vote/:promptId', apiLimiter, requireParticipant, (req, res) => {
     const promptId = parseInt(req.params.promptId);
     const attendeeId = req.session.attendee.id;
     
@@ -258,14 +312,17 @@ app.get('/login', (req, res) => {
     res.send(getLoginPage());
 });
 
-app.post('/login', (req, res) => {
+app.post('/login', loginLimiter, (req, res) => {
     const { username, password } = req.body;
-    const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+    if (!username || !password) return res.send(getLoginPage('Username and password required'));
+    const user = db.prepare('SELECT * FROM users WHERE username = ?').get(String(username).slice(0, 64));
     
-    if (!user || !bcrypt.compareSync(password, user.password_hash)) {
+    if (!user || !bcrypt.compareSync(String(password), user.password_hash)) {
+        logger.warn({ msg: 'Failed login', username, ip: req.ip });
         return res.send(getLoginPage('Invalid credentials'));
     }
     
+    logger.info({ msg: 'Admin login', username: user.username });
     req.session.user = { id: user.id, username: user.username, role: user.role };
     res.redirect('/admin');
 });
@@ -356,14 +413,35 @@ app.post('/admin/events/:code/research/:orgName', requireAdmin, async (req, res)
     }
 });
 
-// Generate prompts using Azure OpenAI
+// Generate prompts using Azure OpenAI (or mock mode)
 async function generateOrgPrompts(orgName) {
+    // Mock mode: return sample prompts without calling Azure OpenAI
+    if (process.env.MOCK_AI === 'true') {
+        logger.info({ msg: 'Mock AI mode — returning sample prompts', org: orgName });
+        return [
+            { text: `Draft a briefing memo summarizing ${orgName}'s top priorities for the quarter using Copilot in Word.`, category: 'Writing', app: 'Word' },
+            { text: `Analyze our budget data and highlight variances over 10% using Copilot in Excel.`, category: 'Analysis', app: 'Excel' },
+            { text: `Summarize the last 30 days of emails related to ${orgName} policy updates using Copilot in Outlook.`, category: 'Communication', app: 'Outlook' },
+            { text: `Create a status-update presentation for leadership covering milestones and risks using Copilot in PowerPoint.`, category: 'Planning', app: 'PowerPoint' },
+            { text: `Generate meeting notes and action items from our last all-hands using Copilot in Teams.`, category: 'Communication', app: 'Teams' },
+            { text: `Build a project tracking template for ${orgName} tasks with automated status formulas using Copilot in Excel.`, category: 'Data', app: 'Excel' },
+            { text: `Write a plain-language summary of the latest regulatory guidance relevant to ${orgName} using Copilot in Word.`, category: 'Writing', app: 'Word' },
+            { text: `Identify recurring themes in employee feedback survey responses for ${orgName} using Copilot.`, category: 'Analysis', app: 'General' },
+        ];
+    }
+
     const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
     const apiKey = process.env.AZURE_OPENAI_KEY;
     const deployment = process.env.AZURE_OPENAI_DEPLOYMENT;
     const apiVersion = process.env.AZURE_OPENAI_API_VERSION || '2024-12-01-preview';
-    
-    const response = await fetch(`${endpoint}/openai/deployments/${deployment}/chat/completions?api-version=${apiVersion}`, {
+    // Validate env vars and normalize endpoint
+    if (!endpoint) throw new Error('Missing AZURE_OPENAI_ENDPOINT environment variable');
+    if (!apiKey) throw new Error('Missing AZURE_OPENAI_KEY environment variable');
+    if (!deployment) throw new Error('Missing AZURE_OPENAI_DEPLOYMENT environment variable');
+
+    const endpointUrl = endpoint.replace(/\/+$/, '');
+
+    const response = await fetch(`${endpointUrl}/openai/deployments/${deployment}/chat/completions?api-version=${apiVersion}`, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
@@ -446,7 +524,7 @@ io.on('connection', (socket) => {
     });
 });
 
-// Export prompts
+// Export prompts – JSON (default) or CSV via ?format=csv
 app.get('/admin/events/:code/export', requireAdmin, (req, res) => {
     const event = db.prepare('SELECT * FROM events WHERE code = ?').get(req.params.code);
     if (!event) return res.status(404).send('Event not found');
@@ -460,9 +538,111 @@ app.get('/admin/events/:code/export', requireAdmin, (req, res) => {
         ORDER BY p.votes DESC
     `).all(event.id);
     
+    if (req.query.format === 'csv') {
+        const csv = stringify(prompts, { header: true });
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', `attachment; filename="${event.code}-prompts.csv"`);
+        return res.send(csv);
+    }
     res.setHeader('Content-Type', 'application/json');
     res.setHeader('Content-Disposition', `attachment; filename="${event.code}-prompts.json"`);
     res.send(JSON.stringify(prompts, null, 2));
+});
+
+// Bulk import attendees from CSV upload
+app.post('/admin/events/:code/import', requireAdmin, upload.single('csvfile'), (req, res) => {
+    const event = db.prepare('SELECT id FROM events WHERE code = ?').get(req.params.code);
+    if (!event) return res.status(404).json({ error: 'Event not found' });
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+
+    const lines = req.file.buffer.toString('utf8').split(/\r?\n/).filter(Boolean);
+    // Expect header: name,org,role,email
+    const header = lines[0].toLowerCase().split(',').map(h => h.trim());
+    const nameIdx = header.indexOf('name');
+    const orgIdx  = header.indexOf('org');
+    const roleIdx = header.indexOf('role');
+    const emailIdx = header.indexOf('email');
+    if (nameIdx === -1 || orgIdx === -1) return res.status(400).json({ error: 'CSV must have at least name,org columns' });
+
+    let added = 0, skipped = 0;
+    const insertOrg     = db.prepare('INSERT OR IGNORE INTO orgs (event_id, name) VALUES (?, ?)');
+    const insertAttendee = db.prepare('INSERT OR IGNORE INTO attendees (event_id, name, email, org, role, join_code) VALUES (?, ?, ?, ?, ?, ?)');
+
+    const importMany = db.transaction((rows) => {
+        for (const row of rows) {
+            const cols = row.split(',').map(c => c.trim().replace(/^"|"$/g, ''));
+            const name = cols[nameIdx]; const org = cols[orgIdx];
+            if (!name || !org) { skipped++; continue; }
+            const joinCode = generateCode(8);
+            insertOrg.run(event.id, org);
+            const result = insertAttendee.run(event.id, name, emailIdx >= 0 ? cols[emailIdx] : null, org, roleIdx >= 0 ? cols[roleIdx] : null, joinCode);
+            if (result.changes) added++; else skipped++;
+        }
+    });
+    importMany(lines.slice(1));
+    logger.info({ msg: 'Bulk import', event: req.params.code, added, skipped });
+    res.json({ success: true, added, skipped });
+});
+
+// Flag prompt
+app.post('/admin/prompts/:id/flag', requireAdmin, (req, res) => {
+    const promptId = parseInt(req.params.id);
+    const { reason } = req.body;
+    db.prepare('INSERT OR REPLACE INTO prompt_flags (prompt_id, reason) VALUES (?, ?)').run(promptId, reason || null);
+    res.json({ success: true });
+});
+
+// Unflag / delete prompt
+app.delete('/admin/prompts/:id', requireAdmin, (req, res) => {
+    const promptId = parseInt(req.params.id);
+    db.prepare('DELETE FROM prompt_flags WHERE prompt_id = ?').run(promptId);
+    db.prepare('DELETE FROM votes WHERE prompt_id = ?').run(promptId);
+    db.prepare('DELETE FROM prompts WHERE id = ?').run(promptId);
+    res.json({ success: true });
+});
+
+// ============ USER MANAGEMENT ============
+app.get('/admin/users', requireAdmin, (req, res) => {
+    const users = db.prepare('SELECT id, username, role, created_at FROM users ORDER BY created_at').all();
+    res.send(getUsersPage(users, req.session.user));
+});
+
+app.post('/admin/users', requireAdmin, (req, res) => {
+    const { username, password, role } = req.body;
+    if (!username || !password || password.length < 8) {
+        return res.redirect('/admin/users?error=Username+and+password+(min+8+chars)+required');
+    }
+    const hash = bcrypt.hashSync(String(password), 12);
+    try {
+        db.prepare('INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)').run(
+            String(username).slice(0, 64), hash, role === 'admin' ? 'admin' : 'viewer'
+        );
+    } catch (e) {
+        return res.redirect('/admin/users?error=Username+already+exists');
+    }
+    res.redirect('/admin/users');
+});
+
+app.post('/admin/users/password', requireAdmin, (req, res) => {
+    const { current_password, new_password, confirm_password } = req.body;
+    if (new_password !== confirm_password) return res.redirect('/admin/users?error=Passwords+do+not+match');
+    if (!new_password || new_password.length < 8) return res.redirect('/admin/users?error=New+password+must+be+at+least+8+chars');
+    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.session.user.id);
+    if (!bcrypt.compareSync(String(current_password), user.password_hash)) {
+        return res.redirect('/admin/users?error=Current+password+incorrect');
+    }
+    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(String(new_password), 12), user.id);
+    logger.info({ msg: 'Password changed', username: user.username });
+    res.redirect('/admin/users?success=Password+updated');
+});
+
+app.delete('/admin/users/:id', requireAdmin, (req, res) => {
+    const userId = parseInt(req.params.id);
+    if (userId === req.session.user.id) return res.status(400).json({ error: 'Cannot delete yourself' });
+    const count = db.prepare('SELECT COUNT(*) as c FROM users WHERE role = ?').get('admin').c;
+    if (count <= 1) return res.status(400).json({ error: 'Cannot delete the last admin' });
+    db.prepare('DELETE FROM users WHERE id = ?').run(userId);
+    res.json({ success: true });
 });
 
 // ============ PAGE TEMPLATES ============
@@ -649,7 +829,7 @@ function getAdminPage(events, user) {
 <body>
     <div class="header">
         <h1>🎯 Prompt-a-thon Admin</h1>
-        <div>👤 ${user.username} | <a href="/logout">Logout</a></div>
+        <div>👤 ${user.username} | <a href="/admin/users">Users</a> | <a href="/logout">Logout</a></div>
     </div>
     <div class="container">
         <div class="card">
@@ -745,6 +925,8 @@ function getEventDetailPage(event, attendees, orgs, prompts, qrDataUrl) {
         .research-btn:disabled { background: #9ca3af; cursor: wait; }
         .researched { color: #059669; font-size: 0.85rem; }
         .full-width { grid-column: 1 / -1; }
+        .del-btn { background: none; border: none; cursor: pointer; font-size: 1rem; opacity: 0.5; }
+        .del-btn:hover { opacity: 1; }
         @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
     </style>
 </head>
@@ -762,7 +944,8 @@ function getEventDetailPage(event, attendees, orgs, prompts, qrDataUrl) {
                 <div class="url">prompt.turek.in/join/${event.code}</div>
                 <div class="actions">
                     <a href="/wall/${event.code}" target="_blank">📺 Live Wall</a>
-                    <a href="/admin/events/${event.code}/export" class="secondary">📥 Export</a>
+                    <a href="/admin/events/${event.code}/export" class="secondary">📥 JSON</a>
+                    <a href="/admin/events/${event.code}/export?format=csv" class="secondary">📊 CSV</a>
                 </div>
             </div>
             
@@ -782,6 +965,13 @@ function getEventDetailPage(event, attendees, orgs, prompts, qrDataUrl) {
                         <button type="submit">Add</button>
                     </div>
                 </form>
+                <form id="importForm" enctype="multipart/form-data" style="margin-bottom:1rem">
+                    <div class="form-row" style="align-items:center">
+                        <label style="font-size:0.85rem;color:#666">Bulk import CSV (name,org,role,email):</label>
+                        <input type="file" name="csvfile" accept=".csv" required style="flex:1;border:none;padding:0">
+                        <button type="button" onclick="importCSV()">📥 Import</button>
+                    </div>
+                </form>
                 ${attendees.length ? `
                     <table>
                         <thead><tr><th>Name</th><th>Organization</th><th>Role</th><th>Join Code</th><th>Joined</th></tr></thead>
@@ -794,15 +984,16 @@ function getEventDetailPage(event, attendees, orgs, prompts, qrDataUrl) {
                 <h2>💬 Prompts (${prompts.length})</h2>
                 ${prompts.length ? `
                     <table>
-                        <thead><tr><th>Prompt</th><th>Org</th><th>App</th><th>Source</th><th>Votes</th></tr></thead>
+                        <thead><tr><th>Prompt</th><th>Org</th><th>App</th><th>Source</th><th>Votes</th><th></th></tr></thead>
                         <tbody>
-                            ${prompts.slice(0, 20).map(p => `
+                            ${prompts.slice(0, 50).map(p => `
                                 <tr>
                                     <td style="max-width:400px">${p.text.substring(0, 100)}${p.text.length > 100 ? '...' : ''}</td>
                                     <td>${p.org_name || '-'}</td>
                                     <td>${p.app || '-'}</td>
                                     <td>${p.source}</td>
                                     <td>${p.votes}</td>
+                                    <td><button class="del-btn" onclick="deletePrompt(${p.id}, this)">🗑️</button></td>
                                 </tr>
                             `).join('')}
                         </tbody>
@@ -816,23 +1007,133 @@ function getEventDetailPage(event, attendees, orgs, prompts, qrDataUrl) {
             const btn = event.target;
             btn.disabled = true;
             btn.textContent = 'Researching...';
-            
             try {
                 const res = await fetch('/admin/events/${event.code}/research/' + orgName, { method: 'POST' });
                 const data = await res.json();
-                if (res.ok) {
-                    alert('Generated ' + data.promptCount + ' prompts!');
-                    location.reload();
-                } else {
-                    alert('Error: ' + data.error);
-                    btn.disabled = false;
-                    btn.textContent = '🔬 Research & Generate';
-                }
-            } catch (e) {
-                alert('Network error');
-                btn.disabled = false;
-                btn.textContent = '🔬 Research & Generate';
-            }
+                if (res.ok) { alert('Generated ' + data.promptCount + ' prompts!'); location.reload(); }
+                else { alert('Error: ' + data.error); btn.disabled = false; btn.textContent = '🔬 Research & Generate'; }
+            } catch (e) { alert('Network error'); btn.disabled = false; btn.textContent = '🔬 Research & Generate'; }
+        }
+
+        async function deletePrompt(id, btn) {
+            if (!confirm('Delete this prompt? This cannot be undone.')) return;
+            const res = await fetch('/admin/prompts/' + id, { method: 'DELETE' });
+            if (res.ok) btn.closest('tr').remove();
+            else alert('Failed to delete');
+        }
+
+        async function importCSV() {
+            const form = document.getElementById('importForm');
+            const fd = new FormData(form);
+            const res = await fetch('/admin/events/${event.code}/import', { method: 'POST', body: fd });
+            const data = await res.json();
+            if (res.ok) { alert('Imported ' + data.added + ' attendees, skipped ' + data.skipped); location.reload(); }
+            else alert('Import error: ' + data.error);
+        }
+    </script>
+</body>
+</html>`;
+}
+
+function getUsersPage(users, currentUser) {
+    const userRows = users.map(u => `
+        <tr>
+            <td>${u.username}</td>
+            <td><span class="status status-${u.role}">${u.role}</span></td>
+            <td>${u.created_at}</td>
+            <td>${u.id !== currentUser.id ? `<button onclick="deleteUser(${u.id}, this)">🗑️</button>` : '<span style="color:#999">you</span>'}</td>
+        </tr>
+    `).join('');
+
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>User Management - Prompt-a-thon</title>
+    <style>
+        :root { --primary: #0078d4; --bg: #f5f5f5; --card: #ffffff; }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'Segoe UI', sans-serif; background: var(--bg); }
+        .header { background: var(--card); padding: 1rem 2rem; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #e0e0e0; }
+        .container { max-width: 800px; margin: 0 auto; padding: 2rem; }
+        .card { background: var(--card); border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+        .card h2 { margin-bottom: 1rem; font-size: 1.1rem; }
+        .form-row { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.75rem; }
+        .form-row input, .form-row select { flex: 1; min-width: 120px; padding: 0.6rem; border: 2px solid #e0e0e0; border-radius: 8px; font-size: 0.95rem; }
+        .form-row button { padding: 0.6rem 1.25rem; background: var(--primary); color: white; border: none; border-radius: 8px; cursor: pointer; font-weight: 600; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 0.75rem; text-align: left; border-bottom: 1px solid #e0e0e0; }
+        th { font-weight: 600; color: #666; font-size: 0.85rem; }
+        .status { padding: 0.2rem 0.6rem; border-radius: 12px; font-size: 0.8rem; font-weight: 600; }
+        .status-admin { background: #dbeafe; color: #1e40af; }
+        .status-viewer { background: #f3f4f6; color: #374151; }
+        .alert { padding: 0.75rem 1rem; border-radius: 8px; margin-bottom: 1rem; font-size: 0.95rem; }
+        .alert-error { background: #fef2f2; color: #dc2626; }
+        .alert-success { background: #d1fae5; color: #065f46; }
+        .back { font-size: 0.9rem; color: #666; text-decoration: none; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>👥 User Management</h1>
+        <div><a href="/admin" class="back">← Back to Admin</a> | <a href="/logout">Logout</a></div>
+    </div>
+    <div class="container">
+        ${new URLSearchParams(typeof location !== 'undefined' ? location.search : '').get('error') ? '' : ''}
+        <div class="card">
+            <h2>➕ Add Admin User</h2>
+            <form method="POST" action="/admin/users">
+                <div class="form-row">
+                    <input type="text" name="username" placeholder="Username" required>
+                    <input type="password" name="password" placeholder="Password (min 8 chars)" required minlength="8">
+                    <select name="role"><option value="admin">Admin</option><option value="viewer">Viewer</option></select>
+                    <button type="submit">Add User</button>
+                </div>
+            </form>
+        </div>
+
+        <div class="card">
+            <h2>🔑 Change Your Password</h2>
+            <form method="POST" action="/admin/users/password">
+                <div class="form-row">
+                    <input type="password" name="current_password" placeholder="Current password" required>
+                    <input type="password" name="new_password" placeholder="New password (min 8 chars)" required minlength="8">
+                    <input type="password" name="confirm_password" placeholder="Confirm new password" required>
+                    <button type="submit">Update</button>
+                </div>
+            </form>
+        </div>
+
+        <div class="card">
+            <h2>👤 Users (${users.length})</h2>
+            <table>
+                <thead><tr><th>Username</th><th>Role</th><th>Created</th><th></th></tr></thead>
+                <tbody>${userRows}</tbody>
+            </table>
+        </div>
+    </div>
+    <script>
+        // Show flash messages from query string
+        const params = new URLSearchParams(location.search);
+        if (params.get('error')) {
+            const div = document.createElement('div');
+            div.className = 'alert alert-error';
+            div.textContent = decodeURIComponent(params.get('error'));
+            document.querySelector('.container').prepend(div);
+        }
+        if (params.get('success')) {
+            const div = document.createElement('div');
+            div.className = 'alert alert-success';
+            div.textContent = decodeURIComponent(params.get('success'));
+            document.querySelector('.container').prepend(div);
+        }
+        async function deleteUser(id, btn) {
+            if (!confirm('Delete this user?')) return;
+            const res = await fetch('/admin/users/' + id, { method: 'DELETE' });
+            const data = await res.json();
+            if (res.ok) btn.closest('tr').remove();
+            else alert(data.error);
         }
     </script>
 </body>
@@ -1144,8 +1445,14 @@ function getLiveWallPage(event, prompts, topPrompts) {
 </html>`;
 }
 
+// ============ ERROR HANDLER ============
+app.use((err, req, res, next) => {
+    logger.error({ msg: 'Unhandled error', err: err.message, stack: err.stack, url: req.url });
+    res.status(500).json({ error: 'Internal server error' });
+});
+
 // Start server
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`Prompt-a-thon Platform running on port ${PORT}`);
+    logger.info(`Prompt-a-thon Platform running on port ${PORT}`, { env: process.env.NODE_ENV || 'development' });
 });
