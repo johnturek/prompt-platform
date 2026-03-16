@@ -80,6 +80,15 @@ db.exec(`
     );
 `);
 
+// Migrations: add columns to existing tables without dropping data
+const migrations = [
+    `ALTER TABLE orgs ADD COLUMN research_data TEXT`,
+    `ALTER TABLE orgs ADD COLUMN researched_at TEXT`,
+];
+for (const sql of migrations) {
+    try { db.prepare(sql).run(); } catch (e) { /* column already exists — safe to ignore */ }
+}
+
 const adminHash = bcrypt.hashSync('CSADemo2026!', 10);
 try {
     db.prepare('INSERT OR IGNORE INTO users (username, password_hash, role) VALUES (?, ?, ?)').run('admin', adminHash, 'admin');

@@ -94,11 +94,20 @@ router.post('/admin/events/:code/orgs', requireAdmin, (req, res) => {
 });
 
 router.delete('/admin/events/:code/orgs/:orgName', requireAdmin, (req, res) => {
-    const orgName = decodeURIComponent(req.params.orgName);
-    const event = db.prepare('SELECT id FROM events WHERE code = ?').get(req.params.code);
-    if (!event) return res.status(404).json({ error: 'Event not found' });
-    db.prepare('DELETE FROM orgs WHERE event_id = ? AND name = ?').run(event.id, orgName);
-    res.json({ ok: true });
+    try {
+        const orgName = req.params.orgName; // Express already URL-decodes route params
+        const event = db.prepare('SELECT id FROM events WHERE code = ?').get(req.params.code);
+        if (!event) return res.status(404).json({ error: 'Event not found' });
+        const org = db.prepare('SELECT id FROM orgs WHERE event_id = ? AND name = ?').get(event.id, orgName);
+        if (org) {
+            db.prepare('UPDATE prompts SET org_id = NULL WHERE org_id = ?').run(org.id);
+            db.prepare('DELETE FROM orgs WHERE id = ?').run(org.id);
+        }
+        res.json({ ok: true });
+    } catch (e) {
+        logger.error({ msg: 'Delete org error', err: e.message, code: req.params.code, org: req.params.orgName });
+        res.status(500).json({ error: e.message });
+    }
 });
 
 router.post('/admin/events/:code/status', requireAdmin, (req, res) => {
