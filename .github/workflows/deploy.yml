@@ -51,6 +51,9 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Write build SHA to version file
+        run: echo "${{ github.sha }}" > .version
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
