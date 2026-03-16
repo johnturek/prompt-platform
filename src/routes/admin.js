@@ -134,7 +134,7 @@ router.post('/admin/events/:code/research/:orgName', requireAdmin, async (req, r
     }
     
     try {
-        const prompts = await generateOrgPrompts(orgName, req.body.guidance || '');
+        const prompts = await generateOrgPrompts(orgName, req.body.guidance || '', req.body.count || 10, req.body.products || []);
         
         const insertPrompt = db.prepare('INSERT INTO prompts (event_id, org_id, text, category, app, source) VALUES (?, ?, ?, ?, ?, ?)');
         

@@ -1,6 +1,9 @@
 const logger = require('../logger');
 
-async function generateOrgPrompts(orgName, guidance = '') {
+async function generateOrgPrompts(orgName, guidance = '', count = 10, products = []) {
+    const productList = products.length > 0 ? products : ['Word','Excel','PowerPoint','Outlook','Teams','Copilot Chat','General'];
+    const countNum = Math.min(Math.max(parseInt(count) || 10, 4), 30);
+
     if (process.env.MOCK_AI === 'true') {
         logger.info({ msg: 'Mock AI mode — returning sample prompts', org: orgName });
         return [
@@ -12,7 +15,7 @@ async function generateOrgPrompts(orgName, guidance = '') {
             { text: `Build a project tracking template for ${orgName} tasks with automated status formulas using Copilot in Excel.`, category: 'Data', app: 'Excel' },
             { text: `Write a plain-language summary of the latest regulatory guidance relevant to ${orgName} using Copilot in Word.`, category: 'Writing', app: 'Word' },
             { text: `Identify recurring themes in employee feedback survey responses for ${orgName} using Copilot.`, category: 'Analysis', app: 'General' },
-        ];
+        ].slice(0, countNum);
     }
 
     const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
@@ -28,6 +31,8 @@ async function generateOrgPrompts(orgName, guidance = '') {
     const guidanceClause = guidance.trim()
         ? `\n\nAdditional context from the event organizer:\n${guidance.trim()}`
         : '';
+
+    const productClause = `\n\nFocus ONLY on these Microsoft products (use them for the "app" field): ${productList.join(', ')}. Do not include prompts for other products.`;
 
     const response = await fetch(`${endpointUrl}/openai/deployments/${deployment}/chat/completions?api-version=${apiVersion}`, {
         method: 'POST',
@@ -50,9 +55,9 @@ Return a JSON array of 8-10 prompts.`
                 },
                 {
                     role: 'user',
-                    content: `Generate Microsoft Copilot prompts specifically tailored for employees at ${orgName}. Consider their mission, typical work tasks, and how AI could help them be more productive.${guidanceClause}
+                    content: `Generate Microsoft Copilot prompts specifically tailored for employees at ${orgName}. Consider their mission, typical work tasks, and how AI could help them be more productive.${guidanceClause}${productClause}
 
-Return ONLY a valid JSON array like:
+Return EXACTLY ${countNum} prompts as a valid JSON array like:
 [{"text": "prompt text here", "category": "Writing", "app": "Word"}, ...]`
                 }
             ],

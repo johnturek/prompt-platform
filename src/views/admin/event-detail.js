@@ -196,11 +196,30 @@ function getEventDetailPage(event, attendees, orgs, prompts, qrDataUrl) {
     </div>
     <!-- Research modal -->
     <div id="researchModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center">
-        <div style="background:#fff;border-radius:12px;padding:2rem;max-width:520px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.2)">
+        <div style="background:#fff;border-radius:12px;padding:2rem;max-width:560px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.2);max-height:90vh;overflow-y:auto">
             <h2 style="margin-bottom:0.25rem;font-size:1.15rem">🔬 Research & Generate Prompts</h2>
             <p id="researchModalOrg" style="color:#6b7280;font-size:0.9rem;margin-bottom:1.25rem"></p>
+
+            <label style="font-weight:600;font-size:0.9rem;display:block;margin-bottom:0.5rem">Microsoft products to include</label>
+            <div id="productCheckboxes" style="display:grid;grid-template-columns:1fr 1fr;gap:0.35rem 1rem;margin-bottom:1.25rem;font-size:0.88rem">
+                ${[
+                    ['Word','Word'],['Excel','Excel'],['PowerPoint','PowerPoint'],
+                    ['Outlook','Outlook'],['Teams','Teams'],['Copilot Chat','Copilot Chat'],
+                    ['OneNote','OneNote'],['SharePoint','SharePoint'],['Loop','Loop'],['General','General']
+                ].map(([label, val]) => `
+                <label style="display:flex;align-items:center;gap:0.4rem;cursor:pointer">
+                    <input type="checkbox" class="product-cb" value="${val}" checked style="accent-color:#7c3aed;width:15px;height:15px">
+                    ${label}
+                </label>`).join('')}
+            </div>
+
+            <div style="display:flex;align-items:center;gap:1rem;margin-bottom:1.25rem">
+                <label style="font-weight:600;font-size:0.9rem;white-space:nowrap">Number of prompts</label>
+                <input type="number" id="promptCount" value="10" min="4" max="30" style="width:70px;padding:0.4rem 0.5rem;border:2px solid #e5e7eb;border-radius:6px;font-size:0.9rem;text-align:center">
+            </div>
+
             <label style="font-weight:600;font-size:0.9rem;display:block;margin-bottom:0.4rem">Additional guidance <span style="font-weight:400;color:#9ca3af">(optional)</span></label>
-            <textarea id="researchGuidance" rows="4" placeholder="e.g. Focus on HR and IT departments. Attendees are primarily benefits coordinators and helpdesk staff. Emphasize automating repetitive tasks and writing policy documents." style="width:100%;padding:0.6rem;border:2px solid #e5e7eb;border-radius:8px;font-size:0.9rem;font-family:inherit;resize:vertical;margin-bottom:1rem"></textarea>
+            <textarea id="researchGuidance" rows="3" placeholder="e.g. Focus on HR and IT departments. Attendees are primarily benefits coordinators and helpdesk staff. Emphasize automating repetitive tasks and writing policy documents." style="width:100%;padding:0.6rem;border:2px solid #e5e7eb;border-radius:8px;font-size:0.9rem;font-family:inherit;resize:vertical;margin-bottom:1rem"></textarea>
             <div style="display:flex;gap:0.75rem;justify-content:flex-end">
                 <button onclick="closeResearchModal()" style="padding:0.5rem 1.25rem;border:2px solid #e5e7eb;border-radius:6px;background:#fff;cursor:pointer;font-size:0.9rem">Cancel</button>
                 <button id="researchSubmitBtn" onclick="submitResearch()" style="padding:0.5rem 1.25rem;background:#7c3aed;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:0.9rem;font-weight:600">Generate Prompts</button>
@@ -214,6 +233,8 @@ function getEventDetailPage(event, attendees, orgs, prompts, qrDataUrl) {
             _researchOrgName = orgName;
             document.getElementById('researchModalOrg').textContent = decodeURIComponent(orgName);
             document.getElementById('researchGuidance').value = '';
+            document.getElementById('promptCount').value = '10';
+            document.querySelectorAll('.product-cb').forEach(cb => cb.checked = true);
             document.getElementById('researchSubmitBtn').disabled = false;
             document.getElementById('researchSubmitBtn').textContent = 'Generate Prompts';
             const modal = document.getElementById('researchModal');
@@ -234,13 +255,16 @@ function getEventDetailPage(event, attendees, orgs, prompts, qrDataUrl) {
             if (!_researchOrgName) return;
             const btn = document.getElementById('researchSubmitBtn');
             const guidance = document.getElementById('researchGuidance').value;
+            const count = parseInt(document.getElementById('promptCount').value) || 10;
+            const products = [...document.querySelectorAll('.product-cb:checked')].map(cb => cb.value);
+            if (products.length === 0) { alert('Select at least one product.'); return; }
             btn.disabled = true;
             btn.textContent = 'Generating…';
             try {
                 const res = await fetch('/admin/events/${event.code}/research/' + _researchOrgName, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ guidance })
+                    body: JSON.stringify({ guidance, count, products })
                 });
                 const data = await res.json();
                 if (res.ok) { closeResearchModal(); alert('Generated ' + data.promptCount + ' prompts!'); location.reload(); }
