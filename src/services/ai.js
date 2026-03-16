@@ -1,6 +1,6 @@
 const logger = require('../logger');
 
-async function generateOrgPrompts(orgName) {
+async function generateOrgPrompts(orgName, guidance = '') {
     if (process.env.MOCK_AI === 'true') {
         logger.info({ msg: 'Mock AI mode — returning sample prompts', org: orgName });
         return [
@@ -25,6 +25,10 @@ async function generateOrgPrompts(orgName) {
 
     const endpointUrl = endpoint.replace(/\/+$/, '');
 
+    const guidanceClause = guidance.trim()
+        ? `\n\nAdditional context from the event organizer:\n${guidance.trim()}`
+        : '';
+
     const response = await fetch(`${endpointUrl}/openai/deployments/${deployment}/chat/completions?api-version=${apiVersion}`, {
         method: 'POST',
         headers: {
@@ -46,7 +50,7 @@ Return a JSON array of 8-10 prompts.`
                 },
                 {
                     role: 'user',
-                    content: `Generate Microsoft Copilot prompts specifically tailored for employees at ${orgName}. Consider their mission, typical work tasks, and how AI could help them be more productive.
+                    content: `Generate Microsoft Copilot prompts specifically tailored for employees at ${orgName}. Consider their mission, typical work tasks, and how AI could help them be more productive.${guidanceClause}
 
 Return ONLY a valid JSON array like:
 [{"text": "prompt text here", "category": "Writing", "app": "Word"}, ...]`

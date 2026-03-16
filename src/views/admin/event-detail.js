@@ -32,7 +32,7 @@ function getEventDetailPage(event, attendees, orgs, prompts, qrDataUrl) {
                 <div style="display:flex;align-items:center;gap:0.5rem">
                     ${isResearched 
                         ? '<span class="researched">✅ Researched</span>' 
-                        : `<button class="research-btn" onclick="researchOrg('${encodeURIComponent(orgName)}')">🔬 Research & Generate</button>`
+                        : `<button class="research-btn" onclick="openResearchModal('${encodeURIComponent(orgName)}')">🔬 Research & Generate</button>`
                     }
                     <button class="del-btn" title="Remove org" onclick="deleteOrg('${encodeURIComponent(orgName)}', this)" style="opacity:0.4;font-size:0.9rem">🗑️</button>
                 </div>
@@ -194,8 +194,60 @@ function getEventDetailPage(event, attendees, orgs, prompts, qrDataUrl) {
             </div>
         </div>
     </div>
+    <!-- Research modal -->
+    <div id="researchModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center">
+        <div style="background:#fff;border-radius:12px;padding:2rem;max-width:520px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.2)">
+            <h2 style="margin-bottom:0.25rem;font-size:1.15rem">🔬 Research & Generate Prompts</h2>
+            <p id="researchModalOrg" style="color:#6b7280;font-size:0.9rem;margin-bottom:1.25rem"></p>
+            <label style="font-weight:600;font-size:0.9rem;display:block;margin-bottom:0.4rem">Additional guidance <span style="font-weight:400;color:#9ca3af">(optional)</span></label>
+            <textarea id="researchGuidance" rows="4" placeholder="e.g. Focus on HR and IT departments. Attendees are primarily benefits coordinators and helpdesk staff. Emphasize automating repetitive tasks and writing policy documents." style="width:100%;padding:0.6rem;border:2px solid #e5e7eb;border-radius:8px;font-size:0.9rem;font-family:inherit;resize:vertical;margin-bottom:1rem"></textarea>
+            <div style="display:flex;gap:0.75rem;justify-content:flex-end">
+                <button onclick="closeResearchModal()" style="padding:0.5rem 1.25rem;border:2px solid #e5e7eb;border-radius:6px;background:#fff;cursor:pointer;font-size:0.9rem">Cancel</button>
+                <button id="researchSubmitBtn" onclick="submitResearch()" style="padding:0.5rem 1.25rem;background:#7c3aed;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:0.9rem;font-weight:600">Generate Prompts</button>
+            </div>
+        </div>
+    </div>
     <script>
-        // Live stats polling
+        let _researchOrgName = null;
+
+        function openResearchModal(orgName) {
+            _researchOrgName = orgName;
+            document.getElementById('researchModalOrg').textContent = decodeURIComponent(orgName);
+            document.getElementById('researchGuidance').value = '';
+            document.getElementById('researchSubmitBtn').disabled = false;
+            document.getElementById('researchSubmitBtn').textContent = 'Generate Prompts';
+            const modal = document.getElementById('researchModal');
+            modal.style.display = 'flex';
+            setTimeout(() => document.getElementById('researchGuidance').focus(), 50);
+        }
+
+        function closeResearchModal() {
+            document.getElementById('researchModal').style.display = 'none';
+            _researchOrgName = null;
+        }
+
+        document.getElementById('researchModal').addEventListener('click', e => {
+            if (e.target === document.getElementById('researchModal')) closeResearchModal();
+        });
+
+        async function submitResearch() {
+            if (!_researchOrgName) return;
+            const btn = document.getElementById('researchSubmitBtn');
+            const guidance = document.getElementById('researchGuidance').value;
+            btn.disabled = true;
+            btn.textContent = 'Generating…';
+            try {
+                const res = await fetch('/admin/events/${event.code}/research/' + _researchOrgName, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ guidance })
+                });
+                const data = await res.json();
+                if (res.ok) { closeResearchModal(); alert('Generated ' + data.promptCount + ' prompts!'); location.reload(); }
+                else { alert('Error: ' + data.error); btn.disabled = false; btn.textContent = 'Generate Prompts'; }
+            } catch (e) { alert('Network error'); btn.disabled = false; btn.textContent = 'Generate Prompts'; }
+        }
+
         async function refreshStats() {
             try {
                 const data = await fetch('/api/events/${event.code}/stats').then(r => r.json());
@@ -215,18 +267,6 @@ function getEventDetailPage(event, attendees, orgs, prompts, qrDataUrl) {
                 await navigator.clipboard.writeText(text);
                 alert('Top ' + top.length + ' prompts copied to clipboard!');
             } catch(e) { alert('Copy failed'); }
-        }
-
-        async function researchOrg(orgName) {
-            const btn = event.target;
-            btn.disabled = true;
-            btn.textContent = 'Researching...';
-            try {
-                const res = await fetch('/admin/events/${event.code}/research/' + orgName, { method: 'POST' });
-                const data = await res.json();
-                if (res.ok) { alert('Generated ' + data.promptCount + ' prompts!'); location.reload(); }
-                else { alert('Error: ' + data.error); btn.disabled = false; btn.textContent = '🔬 Research & Generate'; }
-            } catch (e) { alert('Network error'); btn.disabled = false; btn.textContent = '🔬 Research & Generate'; }
         }
 
         async function deletePrompt(id, btn) {
