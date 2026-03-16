@@ -79,13 +79,24 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Trigger Dokploy webhook
+      - name: Trigger Dokploy deploy
         run: |
-          PAYLOAD='{"ref":"${{ github.ref }}","sha":"${{ github.sha }}"}'
-          SIGNATURE="sha256=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "${{ secrets.WEBHOOK_SECRET }}" | cut -d' ' -f2)"
-          curl -X POST "https://deploy.turek.in/deploy/prompt-platform" \
+          curl -s -X POST "http://my.turek.in:3000/api/compose.deploy" \
+            -H "x-api-key: ${{ secrets.DOKPLOY_API_KEY }}" \
             -H "Content-Type: application/json" \
-            -H "X-Hub-Signature-256: $SIGNATURE" \
-            -d "$PAYLOAD" \
+            -d "{\"composeId\": \"${{ secrets.DOKPLOY_COMPOSE_ID }}\"}" \
             --fail --show-error
+
+      - name: Wait for deploy to complete
+        run: |
+          for i in $(seq 1 24); do
+            sleep 5
+            STATUS=$(curl -s "http://my.turek.in:3000/api/compose.one?composeId=${{ secrets.DOKPLOY_COMPOSE_ID }}" \
+              -H "x-api-key: ${{ secrets.DOKPLOY_API_KEY }}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('composeStatus','unknown'))")
+            echo "  Status: $STATUS"
+            if [ "$STATUS" = "done" ]; then echo "✅ Deploy complete"; exit 0; fi
+            if [ "$STATUS" = "error" ]; then echo "❌ Deploy failed"; exit 1; fi
+          done
+          echo "⚠️ Timed out waiting for deploy"
+          exit 1
 
