@@ -15,6 +15,7 @@ RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 RUN mkdir -p /data && chown appuser:appgroup /data
 
 COPY --from=builder /app/node_modules ./node_modules
+ARG CACHEBUST=1
 COPY --chown=appuser:appgroup . .
 
 ARG BUILD_SHA=dev
