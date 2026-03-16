@@ -84,6 +84,23 @@ router.post('/admin/events/:code/attendees', requireAdmin, (req, res) => {
     res.redirect('/admin/events/' + req.params.code);
 });
 
+router.post('/admin/events/:code/orgs', requireAdmin, (req, res) => {
+    const { name } = req.body;
+    if (!name || !name.trim()) return res.redirect('/admin/events/' + req.params.code);
+    const event = db.prepare('SELECT id FROM events WHERE code = ?').get(req.params.code);
+    if (!event) return res.redirect('/admin');
+    db.prepare('INSERT OR IGNORE INTO orgs (event_id, name) VALUES (?, ?)').run(event.id, name.trim());
+    res.redirect('/admin/events/' + req.params.code);
+});
+
+router.delete('/admin/events/:code/orgs/:orgName', requireAdmin, (req, res) => {
+    const orgName = decodeURIComponent(req.params.orgName);
+    const event = db.prepare('SELECT id FROM events WHERE code = ?').get(req.params.code);
+    if (!event) return res.status(404).json({ error: 'Event not found' });
+    db.prepare('DELETE FROM orgs WHERE event_id = ? AND name = ?').run(event.id, orgName);
+    res.json({ ok: true });
+});
+
 router.post('/admin/events/:code/status', requireAdmin, (req, res) => {
     const { status } = req.body;
     if (!['draft', 'active', 'closed'].includes(status)) return res.redirect('/admin/events/' + req.params.code);

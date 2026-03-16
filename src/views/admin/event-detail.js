@@ -1,8 +1,12 @@
 const footer = require('../_footer');
 
 function getEventDetailPage(event, attendees, orgs, prompts, qrDataUrl) {
-    const orgList = [...new Set(attendees.map(a => a.org))];
-    
+    // orgs table is source of truth; attendees may belong to orgs not yet in the table
+    const orgNames = [...new Set([
+        ...orgs.map(o => o.name),
+        ...attendees.map(a => a.org).filter(Boolean)
+    ])].sort();
+
     const attendeeRows = attendees.map(a => `
         <tr>
             <td>${a.name}</td>
@@ -13,19 +17,25 @@ function getEventDetailPage(event, attendees, orgs, prompts, qrDataUrl) {
         </tr>
     `).join('');
     
-    const orgCards = orgList.map(orgName => {
+    const orgCards = orgNames.map(orgName => {
         const org = orgs.find(o => o.name === orgName);
         const promptCount = prompts.filter(p => p.org_name === orgName).length;
+        const attendeeCount = attendees.filter(a => a.org === orgName).length;
         const isResearched = org?.researched_at;
         
         return `
             <div class="org-card">
-                <div class="org-name">${orgName}</div>
-                <div class="org-stats">${promptCount} prompts</div>
-                ${isResearched 
-                    ? '<span class="researched">✅ Researched</span>' 
-                    : `<button class="research-btn" onclick="researchOrg('${encodeURIComponent(orgName)}')">🔬 Research & Generate</button>`
-                }
+                <div>
+                    <div class="org-name">${orgName}</div>
+                    <div class="org-stats">${attendeeCount} attendee${attendeeCount !== 1 ? 's' : ''} · ${promptCount} prompt${promptCount !== 1 ? 's' : ''}</div>
+                </div>
+                <div style="display:flex;align-items:center;gap:0.5rem">
+                    ${isResearched 
+                        ? '<span class="researched">✅ Researched</span>' 
+                        : `<button class="research-btn" onclick="researchOrg('${encodeURIComponent(orgName)}')">🔬 Research & Generate</button>`
+                    }
+                    <button class="del-btn" title="Remove org" onclick="deleteOrg('${encodeURIComponent(orgName)}', this)" style="opacity:0.4;font-size:0.9rem">🗑️</button>
+                </div>
             </div>
         `;
     }).join('');
@@ -107,7 +117,7 @@ function getEventDetailPage(event, attendees, orgs, prompts, qrDataUrl) {
                     <strong style="font-size:0.85rem;color:#666">🖥️ Project:</strong>
                     <a href="/wall/${event.code}" target="_blank" class="actions" style="padding:0.4rem 0.9rem;border-radius:6px;font-size:0.85rem;text-decoration:none">📺 Live Wall</a>
                     <a href="/wall/${event.code}?mode=leaderboard" target="_blank" class="actions purple" style="padding:0.4rem 0.9rem;border-radius:6px;font-size:0.85rem;text-decoration:none">🏆 Leaderboard</a>
-                    ${orgList.map(o => `<a href="/wall/${event.code}?org=${encodeURIComponent(o)}" target="_blank" class="actions secondary" style="padding:0.4rem 0.9rem;border-radius:6px;font-size:0.85rem;text-decoration:none">🏢 ${o}</a>`).join('')}
+                    ${orgNames.map(o => `<a href="/wall/${event.code}?org=${encodeURIComponent(o)}" target="_blank" class="actions secondary" style="padding:0.4rem 0.9rem;border-radius:6px;font-size:0.85rem;text-decoration:none">🏢 ${o}</a>`).join('')}
                 </div>
                 <div class="controls-row">
                     <strong style="font-size:0.85rem;color:#666">📤 Export:</strong>
@@ -126,8 +136,14 @@ function getEventDetailPage(event, attendees, orgs, prompts, qrDataUrl) {
             </div>
             
             <div class="card">
-                <h2>🏢 Organizations (${orgList.length})</h2>
-                ${orgCards || '<p style="color:#666">Add attendees to see organizations</p>'}
+                <h2>🏢 Organizations (${orgNames.length})</h2>
+                <form method="POST" action="/admin/events/${event.code}/orgs" style="margin-bottom:1rem">
+                    <div class="form-row">
+                        <input type="text" name="name" placeholder="Organization name" required>
+                        <button type="submit">+ Add Org</button>
+                    </div>
+                </form>
+                ${orgCards || '<p style="color:#666">No organizations yet. Add one above or import attendees.</p>'}
             </div>
             
             <div class="card full-width">
@@ -218,6 +234,13 @@ function getEventDetailPage(event, attendees, orgs, prompts, qrDataUrl) {
             const res = await fetch('/admin/prompts/' + id, { method: 'DELETE' });
             if (res.ok) btn.closest('tr').remove();
             else alert('Failed to delete');
+        }
+
+        async function deleteOrg(orgName, btn) {
+            if (!confirm('Remove org "' + decodeURIComponent(orgName) + '"? Attendees and prompts tied to it will not be deleted.')) return;
+            const res = await fetch('/admin/events/${event.code}/orgs/' + orgName, { method: 'DELETE' });
+            if (res.ok) btn.closest('.org-card').remove();
+            else alert('Failed to remove org');
         }
 
         async function importCSV() {
