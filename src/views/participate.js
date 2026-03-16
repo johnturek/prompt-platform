@@ -1,3 +1,5 @@
+const footer = require('./_footer');
+
 function getParticipatePage(event, attendee, orgPrompts, allPrompts, userVotes) {
     const apps = ['Word', 'Excel', 'PowerPoint', 'Outlook', 'Teams', 'General'];
     
@@ -207,7 +209,7 @@ function getParticipatePage(event, attendee, orgPrompts, allPrompts, userVotes) 
                 }
             });
         });
-    </script>
+    </script>    ${footer()}
 </body>
 </html>`;
 }

@@ -17,9 +17,11 @@ RUN mkdir -p /data && chown appuser:appgroup /data
 COPY --from=builder /app/node_modules ./node_modules
 COPY --chown=appuser:appgroup . .
 
-USER appuser
-
+ARG BUILD_SHA=dev
+ENV BUILD_SHA=$BUILD_SHA
 ENV NODE_ENV=production PORT=3000
+
+USER appuser
 EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \

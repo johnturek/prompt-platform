@@ -1,3 +1,5 @@
+const footer = require('./_footer');
+
 function getHomePage(error = null) {
     return `<!DOCTYPE html>
 <html lang="en">
@@ -31,7 +33,7 @@ function getHomePage(error = null) {
             <button type="submit">Join Event</button>
         </form>
         <div class="admin-link"><a href="/login">Admin Login</a></div>
-    </div>
+    </div>    ${footer()}
 </body>
 </html>`;
 }

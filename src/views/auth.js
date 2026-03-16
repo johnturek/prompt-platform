@@ -1,3 +1,5 @@
+const footer = require('./_footer');
+
 function getLoginPage(error = null) {
     return `<!DOCTYPE html>
 <html lang="en">
@@ -25,7 +27,7 @@ function getLoginPage(error = null) {
             <input type="password" name="password" placeholder="Password" required>
             <button type="submit">Login</button>
         </form>
-    </div>
+    </div>    ${footer()}
 </body>
 </html>`;
 }

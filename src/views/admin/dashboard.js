@@ -1,3 +1,5 @@
+const footer = require('../_footer');
+
 function getAdminPage(events, user) {
     const eventRows = events.map(e => `
         <tr>
@@ -67,7 +69,7 @@ function getAdminPage(events, user) {
                 </table>
             ` : '<div class="empty">No events yet. Create one above!</div>'}
         </div>
-    </div>
+    </div>    ${footer()}
 </body>
 </html>`;
 }

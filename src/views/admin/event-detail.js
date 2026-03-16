@@ -1,3 +1,5 @@
+const footer = require('../_footer');
+
 function getEventDetailPage(event, attendees, orgs, prompts, qrDataUrl) {
     const orgList = [...new Set(attendees.map(a => a.org))];
     
@@ -226,7 +228,7 @@ function getEventDetailPage(event, attendees, orgs, prompts, qrDataUrl) {
             if (res.ok) { alert('Imported ' + data.added + ' attendees, skipped ' + data.skipped); location.reload(); }
             else alert('Import error: ' + data.error);
         }
-    </script>
+    </script>    ${footer()}
 </body>
 </html>`;
 }

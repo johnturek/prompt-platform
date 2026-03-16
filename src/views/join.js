@@ -1,3 +1,5 @@
+const footer = require('./_footer');
+
 function getEventJoinPage(event, attendees) {
     const attendeesByOrg = {};
     attendees.forEach(a => {
@@ -61,7 +63,7 @@ function getEventJoinPage(event, attendees) {
                 Have a personal join code? <a href="/">Enter it here</a>
             </div>
         </div>
-    </div>
+    </div>    ${footer()}
 </body>
 </html>`;
 }

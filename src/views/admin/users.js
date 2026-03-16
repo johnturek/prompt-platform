@@ -1,3 +1,5 @@
+const footer = require('../_footer');
+
 function getUsersPage(users, currentUser) {
     const userRows = users.map(u => `
         <tr>
@@ -98,7 +100,7 @@ function getUsersPage(users, currentUser) {
             if (res.ok) btn.closest('tr').remove();
             else alert(data.error);
         }
-    </script>
+    </script>    ${footer()}
 </body>
 </html>`;
 }

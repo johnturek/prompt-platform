@@ -1,3 +1,5 @@
+const footer = require('./_footer');
+
 function getEventClosedPage(event) {
     return `<!DOCTYPE html>
 <html lang="en">
@@ -21,7 +23,7 @@ function getEventClosedPage(event) {
         <h1>Thanks for participating!</h1>
         <p>The <span class="event-name">${event.name}</span> workshop has ended. Your prompts and votes have been recorded.</p>
         <p style="font-size:0.9rem;color:#94a3b8">Ask your facilitator to share the results!</p>
-    </div>
+    </div>    ${footer()}
 </body>
 </html>`;
 }
