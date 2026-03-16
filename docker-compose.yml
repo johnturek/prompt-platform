@@ -1,8 +1,7 @@
-version: '3.8'
 services:
   app:
-    build: .
-    image: prompt-platform:latest
+    image: ghcr.io/johnturek/prompt-platform:latest
+    pull_policy: always
     ports:
       - "3000:3000"
     environment:
