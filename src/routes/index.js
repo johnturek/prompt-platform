@@ -8,7 +8,7 @@ module.exports = function registerRoutes(app, io) {
     app.get('/health', (req, res) => {
         try {
             db.prepare('SELECT 1').get();
-            res.json({ status: 'ok', uptime: process.uptime(), ts: new Date().toISOString(), build: process.env.BUILD_SHA || 'dev' });
+            res.json({ status: 'ok', uptime: process.uptime(), ts: new Date().toISOString(), build: require('../views/_build-sha') });
         } catch (e) {
             res.status(503).json({ status: 'error', message: e.message });
         }

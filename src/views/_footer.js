@@ -1,14 +1,4 @@
-const fs = require('fs');
-const path = require('path');
-
-let BUILD_SHA = 'dev';
-try {
-    const versionFile = path.join(__dirname, '../../.version');
-    BUILD_SHA = fs.readFileSync(versionFile, 'utf8').trim() || process.env.BUILD_SHA || 'dev';
-} catch {
-    BUILD_SHA = process.env.BUILD_SHA || 'dev';
-}
-
+const BUILD_SHA = require('./_build-sha');
 const SHORT_SHA = BUILD_SHA === 'dev' ? 'dev' : BUILD_SHA.slice(0, 7);
 const GITHUB_URL = `https://github.com/johnturek/prompt-platform/commit/${BUILD_SHA}`;
 
